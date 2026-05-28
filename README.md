@@ -22,7 +22,7 @@ Drop any image into the web app and compare attention maps side-by-side across b
 
 ```bash
 # Clone the repo
-git clone <repo-url>
+git clone https://github.com/Samwise-Potato-Gamgee/detr-lens.git
 cd detr-lens
 
 # Create venv (Python 3.12 required)
