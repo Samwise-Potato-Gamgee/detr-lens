@@ -104,6 +104,12 @@ def _aggregate_deformable_weights(
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def _dense_to_image_heatmap(spatial: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Resize a (H_feat, W_feat) float32 map to (H, W) using bilinear interpolation."""
+    pil = Image.fromarray((spatial * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+    return np.array(pil, dtype=np.float32) / 255.0
+
+
 def attention_to_heatmap(
     model_output: dict,
     layer_idx: int = -1,
@@ -114,15 +120,24 @@ def attention_to_heatmap(
     """
     Extract and reshape attention weights to a 2-D heatmap array [0,1].
 
-    For deformable models the weights have shape
-    (bs, n_queries, n_heads, n_levels, n_points) — we flatten levels×points
-    and average spatially to get a relative-weight scalar per head.
+    Dense path (DAB-DETR, feat_hw present): weights (bs, n_heads, n_queries, seq_len)
+    reshaped to (H_feat, W_feat) then bilinear-upsampled to image resolution.
+
+    Deformable path (Deformable DETR / RT-DETR): weights (bs, n_queries, n_heads,
+    n_levels, n_points) splatted with Gaussian kernels at sampling locations.
 
     Returns: np.ndarray shape (H, W) in [0,1].
     """
+    H, W = model_output["image_size"]
+
+    # ── Dense path (DAB-DETR) ─────────────────────────────────────────────────
+    if "feat_hw" in model_output and attn_type == "cross":
+        from extractors.dense_attn import extract_dense_cross_attention
+        spatial = extract_dense_cross_attention(model_output, layer_idx, head_idx, query_idx)
+        return _dense_to_image_heatmap(spatial, H, W)
+
     key = "cross_attn_weights" if attn_type == "cross" else "self_attn_weights"
     weights_list = model_output.get(key, [])
-    H, W = model_output["image_size"]
 
     if not weights_list:
         return np.zeros((H, W), dtype=np.float32)
@@ -211,13 +226,26 @@ def render_rollout(
     show_boxes: bool = True,
 ) -> Image.Image:
     """
-    Attention rollout: multiply attention maps across all decoder layers.
+    Attention rollout: accumulate attention maps across all decoder layers.
 
-    For deformable attention we treat each layer's weight map as the attention
-    contribution and multiply them element-wise (with residual skip).
+    Dense path (DAB-DETR): residual rollout on (H_feat, W_feat) maps, bilinear
+    resize to image resolution.
+
+    Deformable path: same accumulation with Gaussian splatting at sampling locs.
     """
-    weights_list = model_output.get("cross_attn_weights", [])
     H, W = model_output["image_size"]
+    weights_list = model_output.get("cross_attn_weights", [])
+
+    # ── Dense path (DAB-DETR) ─────────────────────────────────────────────────
+    if "feat_hw" in model_output:
+        from extractors.dense_attn import extract_dense_rollout
+        spatial = extract_dense_rollout(model_output, head_idx, query_idx)
+        canvas = _dense_to_image_heatmap(spatial, H, W)
+        rgba = _colorise(canvas, cmap)
+        result = _blend(image.resize((W, H)), rgba, alpha)
+        if show_boxes:
+            result = _draw_boxes(result, model_output, query_idx)
+        return result
 
     if not weights_list:
         return image.copy()
@@ -279,27 +307,31 @@ def render_head_diversity(
 ) -> Image.Image:
     """
     Compute pairwise cosine similarity between all attention heads and render
-    as a small heatmap image.
+    as a small heatmap image.  Supports both dense (DAB-DETR) and deformable models.
     """
     weights_list = model_output.get("cross_attn_weights", [])
     if not weights_list:
         H, W = model_output["image_size"]
         return Image.fromarray(np.zeros((H // 4, W // 4, 3), dtype=np.uint8))
 
-    layer = weights_list[layer_idx].squeeze(0)   # (n_queries, n_heads, n_levels, n_points)
-    if hasattr(layer, "numpy"):
-        layer = layer.numpy()
+    # ── Dense path (DAB-DETR) ─────────────────────────────────────────────────
+    if "feat_hw" in model_output:
+        from extractors.dense_attn import extract_dense_head_diversity
+        sim = extract_dense_head_diversity(model_output, layer_idx, query_idx)
+        n_heads = sim.shape[0]
     else:
-        layer = np.array(layer)
-
-    q = layer[query_idx]    # (n_heads, n_levels, n_points)
-    n_heads = q.shape[0]
-    flat = q.reshape(n_heads, -1)   # (n_heads, n_levels*n_points)
-
-    # Pairwise cosine similarity
-    norms = np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
-    normed = flat / norms
-    sim = normed @ normed.T    # (n_heads, n_heads)
+        # Deformable path
+        layer = weights_list[layer_idx].squeeze(0)   # (n_queries, n_heads, n_levels, n_points)
+        if hasattr(layer, "numpy"):
+            layer = layer.numpy()
+        else:
+            layer = np.array(layer)
+        q = layer[query_idx]    # (n_heads, n_levels, n_points)
+        n_heads = q.shape[0]
+        flat = q.reshape(n_heads, -1)   # (n_heads, n_levels*n_points)
+        norms = np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
+        normed = flat / norms
+        sim = normed @ normed.T    # (n_heads, n_heads)
 
     fig, ax = plt.subplots(figsize=(4, 3.5), dpi=dpi)
     im = ax.imshow(sim, vmin=0, vmax=1, cmap="coolwarm", interpolation="nearest")
@@ -321,22 +353,28 @@ def render_head_diversity(
 def compute_head_diversity_score(model_output: dict, layer_idx: int = -1, query_idx: int = 0) -> float:
     """
     Return mean pairwise cosine similarity of attention heads (lower = more diverse).
+    Supports both dense (DAB-DETR) and deformable models.
     """
     weights_list = model_output.get("cross_attn_weights", [])
     if not weights_list:
         return 0.0
-    layer = weights_list[layer_idx].squeeze(0)
-    if hasattr(layer, "numpy"):
-        layer = layer.numpy()
+
+    if "feat_hw" in model_output:
+        from extractors.dense_attn import extract_dense_head_diversity
+        sim = extract_dense_head_diversity(model_output, layer_idx, query_idx)
     else:
-        import numpy as np_
-        layer = np_.array(layer)
-    q = layer[query_idx]
-    n_heads = q.shape[0]
-    flat = q.reshape(n_heads, -1)
-    norms = np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
-    normed = flat / norms
-    sim = normed @ normed.T
+        layer = weights_list[layer_idx].squeeze(0)
+        if hasattr(layer, "numpy"):
+            layer = layer.numpy()
+        else:
+            layer = np.array(layer)
+        q = layer[query_idx]
+        n_heads = q.shape[0]
+        flat = q.reshape(n_heads, -1)
+        norms = np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
+        normed = flat / norms
+        sim = normed @ normed.T
+
     mask = np.triu(np.ones_like(sim, dtype=bool), k=1)
     return float(sim[mask].mean())
 

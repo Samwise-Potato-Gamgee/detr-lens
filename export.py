@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from models.deformable_detr import DeformableDETRWrapper
 from models.rtdetr import RTDETRWrapper
+from models.dab_detr import DABDETRWrapper
 from viz.heatmap import render_heatmap, render_rollout
 from viz.offset_grid import render_sampling_offsets
 from viz.side_by_side import render_side_by_side
@@ -49,6 +50,9 @@ def _render_at_dpi(image: Image.Image, out: dict, dpi: int,
     elif mode == "rollout":
         return render_rollout(image, out, query_idx=query_idx)
     elif mode == "offsets":
+        # DAB-DETR uses dense attention — no sampling offsets
+        if out.get("feat_hw"):
+            return image.copy()
         return render_sampling_offsets(image, out, layer_idx=layer_idx, query_idx=query_idx, dpi=dpi)
     return image.copy()
 
@@ -130,7 +134,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export publication-quality attention visualizations")
     parser.add_argument("--input", required=True, help="Image or folder")
     parser.add_argument("--model", default="both",
-                        choices=["deformable-detr", "rt-detr", "both"])
+                        choices=["deformable-detr", "rt-detr", "dab-detr", "both"])
     parser.add_argument("--output", default="exports", help="Output directory")
     parser.add_argument("--n", type=int, default=5, help="Max images to export")
     parser.add_argument("--layer", type=int, default=-1)
@@ -160,6 +164,10 @@ def main():
         w = RTDETRWrapper()
         w.load()
         models["RT-DETR"] = w
+    if args.model == "dab-detr":
+        w = DABDETRWrapper()
+        w.load()
+        models["DAB-DETR"] = w
 
     print(f"Exporting {len(images)} image(s) → {out_dir}/")
 

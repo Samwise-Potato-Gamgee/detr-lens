@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from models.deformable_detr import DeformableDETRWrapper
 from models.rtdetr import RTDETRWrapper
+from models.dab_detr import DABDETRWrapper
 from viz.heatmap import render_heatmap, render_rollout, render_head_diversity
 from viz.offset_grid import render_sampling_offsets, render_per_head_grid
 from viz.side_by_side import render_side_by_side
@@ -70,12 +71,13 @@ def run_and_save(
         except Exception as e:
             print(f"  rollout error: {e}")
 
-        # Sampling offsets
-        try:
-            o = render_sampling_offsets(image, out, layer_idx=layer_idx, query_idx=query_idx)
-            o.save(str(prefix) + "_offsets.png")
-        except Exception as e:
-            print(f"  offsets error: {e}")
+        # Sampling offsets (skipped for DAB-DETR which uses dense attention)
+        if not out.get("feat_hw"):
+            try:
+                o = render_sampling_offsets(image, out, layer_idx=layer_idx, query_idx=query_idx)
+                o.save(str(prefix) + "_offsets.png")
+            except Exception as e:
+                print(f"  offsets error: {e}")
 
         # Head diversity
         try:
@@ -104,7 +106,7 @@ def main():
     parser = argparse.ArgumentParser(description="Batch attention visualization")
     parser.add_argument("--input", required=True, help="Image folder or single image path")
     parser.add_argument("--model", default="both",
-                        choices=["deformable-detr", "rt-detr", "both"],
+                        choices=["deformable-detr", "rt-detr", "dab-detr", "both"],
                         help="Which model(s) to run")
     parser.add_argument("--output", default="results", help="Output directory")
     parser.add_argument("--n", type=int, default=20, help="Max number of images to process")
@@ -132,6 +134,10 @@ def main():
         w = RTDETRWrapper()
         w.load()
         models["RT-DETR"] = w
+    if args.model == "dab-detr":
+        w = DABDETRWrapper()
+        w.load()
+        models["DAB-DETR"] = w
 
     print(f"Models loaded. Processing {len(images)} image(s) → {out_dir}/")
 
